@@ -53,7 +53,7 @@ Describe how to install and run the project here, including environment setup if
 4.1.2. **Generate Tabular Data Using the Diffusion Model:**
    - Run the following command to generate data:
      ```
-     python main.py --dataname amazon --method tabsyn --mode sample --save_path [PATH_TO_SAVE]
+     python main.py --dataname amazon --method tabsyn --mode sample --sample_mode 0 --save_path [PATH_TO_SAVE]
      ```
 
 4.2.1. **Train and Utilize the Consistency Model:**
@@ -63,7 +63,7 @@ Describe how to install and run the project here, including environment setup if
 4.2.2. **Generate Tabular Data Using the Consistency Model:**
    - Generate data using the trained consistency model:
      ```
-     python main.py --dataname amazon --method tabsyn --mode sample --save_path [PATH_TO_SAVE]
+     python main.py --dataname amazon --method tabsyn --mode sample --sample_mode 1 --save_path [PATH_TO_SAVE]
      ```
 
 All synthetic data are finally saved in `/tabsyn/synthetic/amazon`.
