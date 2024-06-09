@@ -58,7 +58,7 @@ Describe how to install and run the project here, including environment setup if
 
 4.2.1. **Train and Utilize the Consistency Model:**
    - After the VAE is trained, upload `train_z.npy` to Colab.
-   - Follow the steps in `consistency_model.ipynb` to train the consistency model. Regenerate and download `train_z.npy` to replace the existing file locally.
+   - Follow the steps in `consistency_model.ipynb` to train the consistency model. Regenerate and download the `train_z.npy` file to replace the current version on your local machine. The file `sample_2step.npy` serves as an example, synthesized by a model trained for consistency using a two-step sampling process.
 
 4.2.2. **Generate Tabular Data Using the Consistency Model:**
    - Generate data using the trained consistency model:
