@@ -66,6 +66,7 @@ Describe how to install and run the project here, including environment setup if
      python main.py --dataname amazon --method tabsyn --mode sample --save_path [PATH_TO_SAVE]
      ```
 
+All synthetic data are finally saved in `/tabsyn/synthetic/amazon`.
 ## Acknowledgments
 Thanks to all contributors and the UCLA faculty who provided guidance and support throughout the course of this project.
 
