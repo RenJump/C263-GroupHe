@@ -2,7 +2,7 @@
 
 ## Project Overview
 This project represents the culmination of efforts from UCLA's C263 course. We have innovated upon the latent diffusion model framework to design a fast tabular data generator that ensures privacy. Our approach introduces two major improvements:
-1. We decoupled the training processes of the VAE and diffusion model components, integrating DP-SGP within the VAE component to protect the privacy of latent variables.
+1. Based on the property of decoupled training processes of the VAE and diffusion model components in latent diffusion model, we integrating DP-SGP within the VAE component to protect the privacy of latent variables.
 2. We replaced the diffusion model component with a consistency model component to enable rapid generation of tabular data.
 
 To our knowledge, this is the first attempt to apply a consistency model for tabular data generation.
@@ -23,13 +23,48 @@ We use data from the CTR Prediction - 2022 DIGIX Global AI Challenge as both our
 Describe how to install and run the project here, including environment setup if specific versions of libraries or tools are necessary.
 
 ## How to Use
-Provide examples on how the models can be trained and how the generated data can be used, possibly with code snippets or command-line examples.
 
-## Contributions
-Details on how others can contribute to the project, including how to submit issues, feature requests, and pull requests.
+### Preparing the Data
+1. **Download and Preprocess the Data:**
+   - Download the training dataset from the 2022 DIGIX Global AI Challenge official website.
+   - Execute the preprocessing scripts provided. Preprocessed files are already included in the folder for quick setup.
 
-## License
-Specify the license under which the project is made available.
+2. **Prepare Configuration Files:**
+   - Create an `amazon.json` info file and place it under `tabsyn/data/Info`. This file is necessary for further data preprocessing tailored for the VAE/Diffusion model training.
+   - Run the preprocessing script:
+     ```
+     python process_dataset.py
+     ```
+
+### Training & Synthesizing
+3. **Train the VAE with DP-SGD Privacy Protection:**
+   - Execute the following command to train the VAE model:
+     ```
+     python main.py --dataname amazon --method vae --mode train
+     ```
+   - Model parameters are saved under `tabsyn/tabsyn/vae/ckpt/amazon`. The `train_z.npy` file, which contains the latent vectors encoded from the training set, is crucial for subsequent model training.
+
+4.1.1. **Train the Diffusion Model:**
+   - After training the VAE, train the Diffusion model independently:
+     ```
+     python main.py --dataname amazon --method tabsyn --mode train
+     ```
+
+4.1.2. **Generate Tabular Data Using the Diffusion Model:**
+   - Run the following command to generate data:
+     ```
+     python main.py --dataname amazon --method tabsyn --mode sample --save_path [PATH_TO_SAVE]
+     ```
+
+4.2.1. **Train and Utilize the Consistency Model:**
+   - After the VAE is trained, upload `train_z.npy` to Colab.
+   - Follow the steps in `consistency_model.ipynb` to train the consistency model. Regenerate and download `train_z.npy` to replace the existing file locally.
+
+4.2.2. **Generate Tabular Data Using the Consistency Model:**
+   - Generate data using the trained consistency model:
+     ```
+     python main.py --dataname amazon --method tabsyn --mode sample --save_path [PATH_TO_SAVE]
+     ```
 
 ## Acknowledgments
 Thanks to all contributors and the UCLA faculty who provided guidance and support throughout the course of this project.
@@ -37,3 +72,6 @@ Thanks to all contributors and the UCLA faculty who provided guidance and suppor
 ## References
 - [Link to tabsyn repository](https://github.com/amazon-science/tabsyn/tree/main)
 - [Link to consistency models repository](https://github.com/Kinyugo/consistency_models)
+- https://www.kaggle.com/datasets/xiaojiu1414/digix-global-ai-challenge
+
+  
