@@ -19,8 +19,6 @@ We use data from the CTR Prediction - 2022 DIGIX Global AI Challenge as both our
 - `tabsyn/`: Includes code for training the VAE/Diffusion model with DP-SGD protection.
 - `consistency_model.ipynb`: A notebook to train the consistency model, specifically configured to run in a Colab environment.
 - `test/`: Contains notebooks to test the quality of synthesize data, including fidelity utility and privacy.
-## Installation
-Describe how to install and run the project here, including environment setup if specific versions of libraries or tools are necessary.
 
 ## How to Use
 
