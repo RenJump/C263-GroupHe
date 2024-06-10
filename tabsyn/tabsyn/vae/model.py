@@ -1,413 +1,294 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.init as nn_init
-import torch.nn.functional as F
-from torch import Tensor
-import typing as ty
-import math
-from opacus.grad_sample import GradSampleModule
-from opacus.grad_sample import register_grad_sampler
+# from opacus.grad_sample import GradSampleModule
+# from opacus.grad_sample import register_grad_sampler
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import argparse
+import warnings
+import os
+from tqdm import tqdm
+import json
+import time
+from opacus import PrivacyEngine
+from tabsyn.vae.model import Model_VAE, Encoder_model, Decoder_model
+from utils_train import preprocess, TabularDataset
+from opacus.accountants import RDPAccountant
+
+warnings.filterwarnings('ignore')
+
+LR = 1e-3
+WD = 0
+D_TOKEN = 4
+TOKEN_BIAS = True
+
+N_HEAD = 1
+FACTOR = 32
+NUM_LAYERS = 2
 
 
-class Tokenizer(nn.Module):
-    def __init__(self, d_numerical, categories, d_token, bias=True):
-        super(Tokenizer, self).__init__()
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.to(self.device)
+def compute_loss(X_num, X_cat, Recon_X_num, Recon_X_cat, mu_z, logvar_z):
+    ce_loss_fn = nn.CrossEntropyLoss()
+    mse_loss = (X_num - Recon_X_num).pow(2).mean()
+    ce_loss = 0
+    acc = 0
+    total_num = 0
 
-        if categories is None:
-            self.category_offsets = None
-            self.category_embeddings = None
-        else:
-            category_offsets = torch.tensor([0] + categories[:-1], device=self.device).cumsum(0)
-            self.register_buffer('category_offsets', category_offsets)
-            self.category_embeddings = nn.Embedding(sum(categories), d_token).to(self.device)
-            nn_init.kaiming_uniform_(self.category_embeddings.weight, a=math.sqrt(5))
-            print(f'{self.category_embeddings.weight.shape=}')
-
-        # 使用带偏置的 nn.Conv1d 替换 nn.Parameter 来设置权重
-        # 设置 groups=d_numerical+1 以保证逐元素乘法，并使用带有偏置的 Conv1d
-            # 使用带偏置的 nn.Conv1d 替换 nn.Parameter 来设置权重
-
-        self.conv = nn.Conv1d(d_numerical + 1, d_token * (d_numerical + 1), kernel_size=1, groups=d_numerical + 1,
-                              bias=True)
-        self.conv.to(self.device)
-        nn.init.kaiming_uniform_(self.conv.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.conv.bias)
-
-    def forward(self, x_num, x_cat):
-        x_some = x_num if x_cat is None else x_cat
-        assert x_some is not None
-
-        x_num = torch.cat(
-            [torch.ones(len(x_some), 1, device=x_some.device)]  # [CLS] token
-            + ([] if x_num is None else [x_num]),
-            dim=1,
-        )
-
-
-
-        # 增加一个通道维度，适应 nn.Conv1d 的输入要求
-        x = x_num.unsqueeze(2)
-
-        num_input_channel = x.shape[1]
-        # 应用卷积
-        x = self.conv(x)
-
-        num_output_channel = x.shape[1]
-        # 移除最后的维度，如果卷积后的输出是 (batch_size, channels, 1)
-        x = x.view(x.shape[0], num_input_channel, int(num_output_channel / num_input_channel))
-
-
-
+    for idx, x_cat in enumerate(Recon_X_cat):
         if x_cat is not None:
-            # 使用 category_offsets 和 category_embeddings
-            x_cat_offset = x_cat + self.category_offsets[None]
-            x_cat_emb = self.category_embeddings(x_cat_offset)
-            x = torch.cat([x, x_cat_emb], dim=1)
-
-        return x
-
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.5):
-        super(MLP, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.dropout = dropout
-
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.dropout = nn.Dropout(p=dropout)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
-
-class MultiheadAttention(nn.Module):
-    def __init__(self, d, n_heads, dropout, initialization = 'kaiming'):
-
-        if n_heads > 1:
-            assert d % n_heads == 0
-        assert initialization in ['xavier', 'kaiming']
-
-        super().__init__()
-        self.W_q = nn.Linear(d, d)
-        self.W_k = nn.Linear(d, d)
-        self.W_v = nn.Linear(d, d)
-        self.W_out = nn.Linear(d, d) if n_heads > 1 else None
-        self.n_heads = n_heads
-        self.dropout = nn.Dropout(dropout) if dropout else None
-
-        for m in [self.W_q, self.W_k, self.W_v]:
-            if initialization == 'xavier' and (n_heads > 1 or m is not self.W_v):
-                # gain is needed since W_qkv is represented with 3 separate layers
-                nn_init.xavier_uniform_(m.weight, gain=1 / math.sqrt(2))
-            nn_init.zeros_(m.bias)
-        if self.W_out is not None:
-            nn_init.zeros_(self.W_out.bias)
-
-    def _reshape(self, x):
-        batch_size, n_tokens, d = x.shape
-        d_head = d // self.n_heads
-        return (
-            x.reshape(batch_size, n_tokens, self.n_heads, d_head)
-            .transpose(1, 2)
-            .reshape(batch_size * self.n_heads, n_tokens, d_head)
-        )
-
-    def forward(self, x_q, x_kv, key_compression = None, value_compression = None):
-
-        q, k, v = self.W_q(x_q), self.W_k(x_kv), self.W_v(x_kv)
-        for tensor in [q, k, v]:
-            assert tensor.shape[-1] % self.n_heads == 0
-        if key_compression is not None:
-            assert value_compression is not None
-            k = key_compression(k.transpose(1, 2)).transpose(1, 2)
-            v = value_compression(v.transpose(1, 2)).transpose(1, 2)
-        else:
-            assert value_compression is None
-
-        batch_size = len(q)
-        d_head_key = k.shape[-1] // self.n_heads
-        d_head_value = v.shape[-1] // self.n_heads
-        n_q_tokens = q.shape[1]
-
-        q = self._reshape(q)
-        k = self._reshape(k)
-
-        a = q @ k.transpose(1, 2)
-        b = math.sqrt(d_head_key)
-        attention = F.softmax(a/b , dim=-1)
-
-
-        if self.dropout is not None:
-            attention = self.dropout(attention)
-        x = attention @ self._reshape(v)
-        x = (
-            x.reshape(batch_size, self.n_heads, n_q_tokens, d_head_value)
-            .transpose(1, 2)
-            .reshape(batch_size, n_q_tokens, self.n_heads * d_head_value)
-        )
-        if self.W_out is not None:
-            x = self.W_out(x)
-
-        return x
-
-class Transformer(nn.Module):
-
-    def __init__(
-        self,
-        n_layers: int,
-        d_token: int,
-        n_heads: int,
-        d_out: int,
-        d_ffn_factor: int,
-        attention_dropout = 0.0,
-        ffn_dropout = 0.0,
-        residual_dropout = 0.0,
-        activation = 'relu',
-        prenormalization = True,
-        initialization = 'kaiming',
-    ):
-        super().__init__()
-
-        def make_normalization():
-            return nn.LayerNorm(d_token)
-
-        d_hidden = int(d_token * d_ffn_factor)
-        self.layers = nn.ModuleList([])
-        for layer_idx in range(n_layers):
-            layer = nn.ModuleDict(
-                {
-                    'attention': MultiheadAttention(
-                        d_token, n_heads, attention_dropout, initialization
-                    ),
-                    'linear0': nn.Linear(
-                        d_token, d_hidden
-                    ),
-                    'linear1': nn.Linear(d_hidden, d_token),
-                    'norm1': make_normalization(),
-                }
-            )
-            if not prenormalization or layer_idx:
-                layer['norm0'] = make_normalization()
-
-            self.layers.append(layer)
-
-        self.activation = nn.ReLU()
-        self.last_activation = nn.ReLU()
-        # self.activation = lib.get_activation_fn(activation)
-        # self.last_activation = lib.get_nonglu_activation_fn(activation)
-        self.prenormalization = prenormalization
-        #self.last_normalization = make_normalization() if prenormalization else None
-        self.ffn_dropout = ffn_dropout
-        self.residual_dropout = residual_dropout
-        #self.head = nn.Linear(d_token, d_out)
-
-
-    def _start_residual(self, x, layer, norm_idx):
-        x_residual = x
-        if self.prenormalization:
-            norm_key = f'norm{norm_idx}'
-            if norm_key in layer:
-                x_residual = layer[norm_key](x_residual)
-        return x_residual
-
-    def _end_residual(self, x, x_residual, layer, norm_idx):
-        if self.residual_dropout:
-            x_residual = F.dropout(x_residual, self.residual_dropout, self.training)
-        x = x + x_residual
-        if not self.prenormalization:
-            x = layer[f'norm{norm_idx}'](x)
-        return x
-
-    def forward(self, x):
-        for layer_idx, layer in enumerate(self.layers):
-            is_last_layer = layer_idx + 1 == len(self.layers)
-
-            x_residual = self._start_residual(x, layer, 0)
-            x_residual = layer['attention'](
-                # for the last attention, it is enough to process only [CLS]
-                x_residual,
-                x_residual,
-            )
-
-            x = self._end_residual(x, x_residual, layer, 0)
-
-            x_residual = self._start_residual(x, layer, 1)
-            x_residual = layer['linear0'](x_residual)
-            x_residual = self.activation(x_residual)
-            if self.ffn_dropout:
-                x_residual = F.dropout(x_residual, self.ffn_dropout, self.training)
-            x_residual = layer['linear1'](x_residual)
-            x = self._end_residual(x, x_residual, layer, 1)
-        return x
-
-
-class AE(nn.Module):
-    def __init__(self, hid_dim, n_head):
-        super(AE, self).__init__()
-
-        self.hid_dim = hid_dim
-        self.n_head = n_head
-
-
-        self.encoder = MultiheadAttention(hid_dim, n_head)
-        self.decoder = MultiheadAttention(hid_dim, n_head)
-
-    def get_embedding(self, x):
-        return self.encoder(x, x).detach()
-
-    def forward(self, x):
-
-        z = self.encoder(x, x)
-        h = self.decoder(z, z)
-
-        return h
-
-class VAE(nn.Module):
-    def __init__(self, d_numerical, categories, num_layers, hid_dim, n_head = 1, factor = 4, bias = True):
-        super(VAE, self).__init__()
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.d_numerical = d_numerical
-        self.categories = categories
-        self.hid_dim = hid_dim
-        d_token = hid_dim
-        self.n_head = n_head
+            ce_loss += ce_loss_fn(x_cat, X_cat[:, idx])
+            x_hat = x_cat.argmax(dim=-1)
+        acc += (x_hat == X_cat[:, idx]).float().sum()
+        total_num += x_hat.shape[0]
 
-        self.Tokenizer = Tokenizer(d_numerical, categories, d_token, bias = bias).to(device)
-
-        self.encoder_mu = Transformer(num_layers, hid_dim, n_head, hid_dim, factor).to(device)
-        self.encoder_logvar = Transformer(num_layers, hid_dim, n_head, hid_dim, factor).to(device)
-
-        self.decoder = Transformer(num_layers, hid_dim, n_head, hid_dim, factor).to(device)
-
-    def get_embedding(self, x):
-        return self.encoder_mu(x, x).detach()
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x_num, x_cat):
-        x = self.Tokenizer(x_num, x_cat)
-
-        mu_z = self.encoder_mu(x)
-        std_z = self.encoder_logvar(x)
-
-        z = self.reparameterize(mu_z, std_z)
-
-
-        batch_size = x_num.size(0)
-        h = self.decoder(z[:,1:])
-
-        return h, mu_z, std_z
-
-class Reconstructor(nn.Module):
-    def __init__(self, d_numerical, categories, d_token):
-        super(Reconstructor, self).__init__()
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.d_numerical = d_numerical
-        self.categories = categories
-        self.d_token = d_token
-
-        #self.weight = nn.Parameter(Tensor(d_numerical, d_token))
-        self.conv = nn.Conv1d(d_numerical * d_token, d_numerical * d_token, kernel_size=1, groups=d_numerical * d_token,
-                              bias=False)
-        self.conv.to(device)
-        nn.init.kaiming_uniform_(self.conv.weight, a=math.sqrt(5))
-
-        #nn.init.xavier_uniform_(self.num_recons, gain=1 / math.sqrt(2))
-        self.cat_recons = nn.ModuleList().to(device)
-
-        for d in categories:
-            recon = nn.Linear(d_token, d)
-            nn.init.xavier_uniform_(recon.weight, gain=1 / math.sqrt(2))
-            self.cat_recons.append(recon)
-
-    def forward(self, h):
-        h_num  = h[:, :self.d_numerical]
-        h_cat  = h[:, self.d_numerical:]
-
-
-        x = h_num.view(h_num.shape[0], h_num.shape[1]*h_num.shape[2], 1).to('cuda:0')
-
-        num_input_channel = h_num.shape[1]
-        num_output_channel = h_num.shape[2]
-        # 应用卷积
-        x = self.conv(x)
-
-        # 移除最后的维度，如果卷积后的输出是 (batch_size, channels, 1)
-        recon_x_num = x.view(x.shape[0], num_input_channel, num_output_channel).sum(-1)
-
-        #recon_x_num = torch.mul(h_num, self.weight.unsqueeze(0)).sum(-1)
-        # 使用 nn.Linear 来完成之前的矩阵乘法和加权求和
-        #recon_x_num = self.num_recons(h_num)
-        recon_x_cat = []
-
-        for i, recon in enumerate(self.cat_recons):
-
-            recon_x_cat.append(recon(h_cat[:, i]))
-
-        return recon_x_num, recon_x_cat
-
-
-class Model_VAE(nn.Module):
-    def __init__(self, num_layers, d_numerical, categories, d_token, n_head = 1, factor = 4,  bias = True):
-        super(Model_VAE, self).__init__()
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.VAE = VAE(d_numerical, categories, num_layers, d_token, n_head = n_head, factor = factor, bias = bias).to(device)
-        self.Reconstructor = Reconstructor(d_numerical, categories, d_token).to(device)
-
-    def get_embedding(self, x_num, x_cat):
-        x = self.Tokenizer(x_num, x_cat)
-        return self.VAE.get_embedding(x)
-
-    def forward(self, x_num, x_cat):
-
-        h, mu_z, std_z = self.VAE(x_num, x_cat)
-
-        # recon_x_num, recon_x_cat = self.Reconstructor(h[:, 1:])
-        recon_x_num, recon_x_cat = self.Reconstructor(h)
-
-        return recon_x_num, recon_x_cat, mu_z, std_z
-
-
-class Encoder_model(nn.Module):
-    def __init__(self, num_layers, d_numerical, categories, d_token, n_head, factor, bias = True):
-        super(Encoder_model, self).__init__()
-        self.Tokenizer = Tokenizer(d_numerical, categories, d_token, bias)
-        self.VAE_Encoder = Transformer(num_layers, d_token, n_head, d_token, factor)
-
-    def load_weights(self, Pretrained_VAE):
-        self.Tokenizer.load_state_dict(Pretrained_VAE.VAE.Tokenizer.state_dict())
-        self.VAE_Encoder.load_state_dict(Pretrained_VAE.VAE.encoder_mu.state_dict())
-
-    def forward(self, x_num, x_cat):
-        x = self.Tokenizer(x_num, x_cat)
-        z = self.VAE_Encoder(x)
-
-        return z
-
-class Decoder_model(nn.Module):
-    def __init__(self, num_layers, d_numerical, categories, d_token, n_head, factor, bias = True):
-        super(Decoder_model, self).__init__()
-        self.VAE_Decoder = Transformer(num_layers, d_token, n_head, d_token, factor)
-        self.Detokenizer = Reconstructor(d_numerical, categories, d_token)
-
-    def load_weights(self, Pretrained_VAE):
-        self.VAE_Decoder.load_state_dict(Pretrained_VAE.VAE.decoder.state_dict())
-        self.Detokenizer.load_state_dict(Pretrained_VAE.Reconstructor.state_dict())
-
-    def forward(self, z):
-
-        h = self.VAE_Decoder(z)
-        print(h.shape)
-        x_hat_num, x_hat_cat = self.Detokenizer(h)
-
-        return x_hat_num, x_hat_cat
+    ce_loss /= (idx + 1)
+    acc /= total_num
+    # loss = mse_loss + ce_loss
+
+    temp = 1 + logvar_z - mu_z.pow(2) - logvar_z.exp()
+
+    loss_kld = -0.5 * torch.mean(temp.mean(-1).mean())
+    return mse_loss, ce_loss, loss_kld, acc
+
+
+def main(args):
+    dataname = args.dataname
+    data_dir = f'data/{dataname}'
+
+    max_beta = args.max_beta
+    min_beta = args.min_beta
+    lambd = args.lambd
+
+    device = args.device
+
+    info_path = f'data/{dataname}/info.json'
+
+    with open(info_path, 'r') as f:
+        info = json.load(f)
+
+    curr_dir = os.path.dirname(os.path.abspath(__file__))
+    ckpt_dir = f'{curr_dir}/ckpt/{dataname}'
+    if not os.path.exists(ckpt_dir):
+        os.makedirs(ckpt_dir)
+
+    model_save_path = f'{ckpt_dir}/model.pt'
+    encoder_save_path = f'{ckpt_dir}/encoder.pt'
+    decoder_save_path = f'{ckpt_dir}/decoder.pt'
+
+    X_num, X_cat, categories, d_numerical = preprocess(data_dir, task_type=info['task_type'])
+
+    X_train_num, _ = X_num
+    X_train_cat, _ = X_cat
+
+    X_train_num, X_test_num = X_num
+    X_train_cat, X_test_cat = X_cat
+
+    X_train_num, X_test_num = torch.tensor(X_train_num).float(), torch.tensor(X_test_num).float()
+    X_train_cat, X_test_cat = torch.tensor(X_train_cat), torch.tensor(X_test_cat)
+
+    train_data = TabularDataset(X_train_num.float(), X_train_cat)
+    print(X_test_cat.shape)
+
+    indices = torch.randperm(X_test_num.size(0))[:X_test_num.size(0) // 2]
+
+    # 使用索引直接从原数据中选取一半数据
+    X_test_num = X_test_num[indices].float().to(device)
+    X_test_cat = X_test_cat[indices].to(device)
+    # X_test_num = X_test_num.float().to(device)
+    # X_test_cat = X_test_cat.to(device)
+
+    batch_size = 1024
+    train_loader = DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+    )
+
+    model = Model_VAE(NUM_LAYERS, d_numerical, categories, D_TOKEN, n_head=N_HEAD, factor=FACTOR, bias=True)
+
+    pre_encoder = Encoder_model(NUM_LAYERS, d_numerical, categories, D_TOKEN, n_head=N_HEAD, factor=FACTOR).to(device)
+    pre_decoder = Decoder_model(NUM_LAYERS, d_numerical, categories, D_TOKEN, n_head=N_HEAD, factor=FACTOR).to(device)
+
+    pre_encoder.eval()
+    pre_decoder.eval()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
+    privacy_engine = PrivacyEngine()
+    # PrivacyEngine(accountant="rdp")
+    print(model)
+    model, optimizer, train_loader = privacy_engine.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=train_loader,
+        noise_multiplier=1.1,
+        max_grad_norm=1.0,
+    )
+
+    #You can also choose to design your own epsilon-budget with following codes
+    '''EPSILON = 50
+    DELTA = 1e-05
+
+    model, optimizer, train_loader = privacy_engine.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=train_loader,
+        max_grad_norm=1.0,
+        target_epsilon=EPSILON,
+        target_delta=DELTA,
+        epochs=100
+    )'''
+
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.95, patience=10, verbose=True)
+
+    num_epochs = 300
+    best_train_loss = float('inf')
+
+    current_lr = optimizer.param_groups[0]['lr']
+    patience = 0
+
+    beta = max_beta
+    start_time = time.time()
+    for epoch in range(num_epochs):
+        pbar = tqdm(train_loader, total=len(train_loader))
+        pbar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
+
+        curr_loss_multi = 0.0
+        curr_loss_gauss = 0.0
+        curr_loss_kl = 0.0
+
+        curr_count = 0
+
+        for batch_num, batch_cat in pbar:
+            model.train()
+            optimizer.zero_grad()
+
+            batch_num = batch_num.to(device)
+            batch_cat = batch_cat.to(device)
+
+            Recon_X_num, Recon_X_cat, mu_z, std_z = model(batch_num, batch_cat)
+
+            loss_mse, loss_ce, loss_kld, train_acc = compute_loss(batch_num, batch_cat, Recon_X_num, Recon_X_cat, mu_z,
+                                                                  std_z)
+
+            loss = loss_mse + loss_ce + beta * loss_kld
+            loss.backward()
+            '''i= 0
+            N = 0
+            for name, param in model.named_parameters():
+                N += 1
+                if param.grad is None:
+                    i+=1
+            print(f"Unused parameter: {i}")
+            print("n",N)'''
+            optimizer.step()
+
+            batch_length = batch_num.shape[0]
+            curr_count += batch_length
+            curr_loss_multi += loss_ce.item() * batch_length
+            curr_loss_gauss += loss_mse.item() * batch_length
+            curr_loss_kl += loss_kld.item() * batch_length
+
+        num_loss = curr_loss_gauss / curr_count
+        cat_loss = curr_loss_multi / curr_count
+        kl_loss = curr_loss_kl / curr_count
+
+        '''
+            Evaluation
+        '''
+        model.eval()
+        with torch.no_grad():
+            Recon_X_num, Recon_X_cat, mu_z, std_z = model(X_test_num, X_test_cat)
+
+            val_mse_loss, val_ce_loss, val_kl_loss, val_acc = compute_loss(X_test_num, X_test_cat, Recon_X_num,
+                                                                           Recon_X_cat, mu_z, std_z)
+            val_loss = val_mse_loss.item() * 0 + val_ce_loss.item()
+
+            scheduler.step(val_loss)
+            new_lr = optimizer.param_groups[0]['lr']
+
+            if new_lr != current_lr:
+                current_lr = new_lr
+                print(f"Learning rate updated: {current_lr}")
+
+            train_loss = val_loss
+            if train_loss < best_train_loss:
+                best_train_loss = train_loss
+                patience = 0
+                torch.save(model.state_dict(), model_save_path)
+            else:
+                patience += 1
+                if patience == 10:
+                    if beta > min_beta:
+                        beta = beta * lambd
+
+        # print('epoch: {}, beta = {:.6f}, Train MSE: {:.6f}, Train CE:{:.6f}, Train KL:{:.6f}, Train ACC:{:6f}'.format(epoch, beta, num_loss, cat_loss, kl_loss, train_acc.item()))
+        print(
+            'epoch: {}, beta = {:.6f}, Train MSE: {:.6f}, Train CE:{:.6f}, Train KL:{:.6f}, Val MSE:{:.6f}, Val CE:{:.6f}, Train ACC:{:6f}, Val ACC:{:6f}'.format(
+                epoch, beta, num_loss, cat_loss, kl_loss, val_mse_loss.item(), val_ce_loss.item(), train_acc.item(),
+                val_acc.item()))
+
+        epsilon = privacy_engine.accountant.get_epsilon(delta=DELTA)
+        # epsilon = privacy_engine.get_epsilon(DELTA)   # Change this line under different privacy measure method
+        print(f"(ε = {epsilon:.2f}, δ = {DELTA})")
+
+        with open(r'C:\Users\RenJump\PycharmProjects\untitled\tabsyn\data\news\training_results.txt', 'a') as file:
+            file.write(
+                'epoch: {}, beta = {:.6f}, Train MSE: {:.6f}, Train CE:{:.6f}, Train KL:{:.6f}, Val MSE:{:.6f}, Val CE:{:.6f}, Train ACC:{:6f}, Val ACC:{:6f}\n'.format(
+                    epoch, beta, num_loss, cat_loss, kl_loss, val_mse_loss.item(), val_ce_loss.item(), train_acc.item(),
+                    val_acc.item()
+                ))
+        if num_loss < 0.0031:
+            break
+    end_time = time.time()
+    print('Training time: {:.4f} mins'.format((end_time - start_time) / 60))
+
+    # Saving latent embeddings
+    with torch.no_grad():
+        pre_encoder.load_weights(model)
+        pre_decoder.load_weights(model)
+
+        torch.save(pre_encoder.state_dict(), encoder_save_path)
+        torch.save(pre_decoder.state_dict(), decoder_save_path)
+
+        X_train_num = X_train_num.to(device)
+        X_train_cat = X_train_cat.to(device)
+
+        print('Successfully load and save the model!')
+        pre_encoder.eval()
+        pre_decoder.eval()
+
+        encoded_batches = []
+
+        for batch_num, batch_cat in train_loader:
+
+            batch_num = batch_num.to(device)
+            batch_cat = batch_cat.to(device)
+
+            encoded_batch = pre_encoder(batch_num, batch_cat).detach()
+            encoded_batches.append(encoded_batch.cpu().numpy())
+
+        train_z = np.concatenate(encoded_batches, axis=0)
+        print(train_z.shape)
+        np.save(f'{ckpt_dir}/train_z.npy', train_z)
+        print('Successfully save pretrained embeddings in disk!')
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser(description='Variational Autoencoder')
+
+    parser.add_argument('--dataname', type=str, default='adult', help='Name of dataset.')
+    parser.add_argument('--gpu', type=int, default=0, help='GPU index.')
+    parser.add_argument('--max_beta', type=float, default=1e-2, help='Initial Beta.')
+    parser.add_argument('--min_beta', type=float, default=1e-5, help='Minimum Beta.')
+    parser.add_argument('--lambd', type=float, default=0.7, help='Decay of Beta.')
+
+    args = parser.parse_args()
+
+    # check cuda
+    if args.gpu != -1 and torch.cuda.is_available():
+        args.device = 'cuda:{}'.format(args.gpu)
+    else:
+        args.device = 'cpu'
