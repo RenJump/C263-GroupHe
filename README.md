@@ -8,7 +8,7 @@ This project represents the culmination of efforts from UCLA's C263 course. We h
 To our knowledge, this is the first attempt to apply a consistency model for tabular data generation.
 
 ## Data
-We use data from the CTR Prediction - 2022 DIGIX Global AI Challenge as both our training and generation target.
+We use data from the CTR Prediction - 2022 DIGIX Global AI Challenge as both our training and generation target. All related data, including the preprocessed raw data file `2022DIGIX.csv`, can be referred to at this [Google Drive link](https://drive.google.com/drive/folders/1_f1GnuCz-80aXst0R2soHnkI7WclhVYI?usp=sharing). Please download and preprocess the data as per the instructions provided in following sections to set up the project environment.
 
 ## Key Innovations
 - **Differential Privacy**: Leveraging the opacus library, a PyTorch-based implementation of DP-SGD, we redesigned the encoder/decoder structure of the VAE component in the tabsyn model to accommodate privacy guarantees without storing individual gradients per batch.
