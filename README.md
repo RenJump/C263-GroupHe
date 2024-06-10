@@ -1,4 +1,4 @@
-# C263-GroupHe: Fast Tabular Data Generator with Privacy Guarantee
+# C263-GroupHe: Efficient and Privacy-Preserving Synthetic Data Generation Using Consistency Models
 
 ## Project Overview
 This project represents the culmination of efforts from UCLA's C263 course. We have innovated upon the latent diffusion model framework to design a fast tabular data generator that ensures privacy. Our approach introduces two major improvements:
